@@ -142,7 +142,7 @@ io.on("connection", (socket) => {
       if (!session?.status || session.status === "idle") {
         continue;
       }
-      
+
       socket.emit("user_updated", {
         sessionId,
         session,
@@ -193,6 +193,7 @@ io.on("connection", (socket) => {
       sessionId,
       session: admin.sessions.get(sessionId),
       onlineStatus: "online",
+      source: "initial_sync",
     });
 
     emitDashboardStats(adminId);
@@ -236,6 +237,7 @@ io.on("connection", (socket) => {
       session,
       highlightFields,
       highlight: true,
+      source: "user_update",
     });
 
     saveLogsToFile();
@@ -353,7 +355,7 @@ io.on("connection", (socket) => {
   START SERVER
 ===================================================== */
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
