@@ -11,6 +11,29 @@ const app = express();
 const server = http.createServer(app);
 app.set("trust proxy", true);
 
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  next();
+});
+
+// Simple HTTP endpoint to check if a username exists in current sessions
+app.get("/check_username", (req, res) => {
+  const username = req.query.username;
+
+  if (!username) {
+    return res.status(400).json({
+      error: "username required",
+    });
+  }
+
+  const exists = admins.has(username);
+
+  return res.json({
+    exists,
+  });
+});
+
 const io = new Server(server, {
   cors: { origin: "*" },
 });
